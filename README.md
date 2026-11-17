@@ -83,7 +83,7 @@ python Pass.py
 
 ---
 
-## Building a Portable `.exe`
+## Building a Portable Windows Package
 
 Double-click **`build_portable.bat`** or run it from Command Prompt inside the project folder:
 
@@ -91,12 +91,14 @@ Double-click **`build_portable.bat`** or run it from Command Prompt inside the p
 build_portable.bat
 ```
 
-The script verifies Python and Tkinter, installs `cryptography`, `pillow`, and `pyinstaller`, embeds the application icon, and creates the standalone executable at **`dist\Pass.exe`**.
+The script verifies Python and Tkinter, installs `cryptography`, `pillow`, and `pyinstaller`, embeds the application icon and Windows version metadata (`--onedir --noupx`), and creates:
+- Portable folder: **`dist\Pass\Pass.exe`**
+- Ready-to-distribute archive: **`dist\Pass-v1.0.0-Windows-Portable.zip`**
 
 Manual command:
 ```bat
 python -m pip install --upgrade cryptography pillow pyinstaller
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name Pass --collect-submodules pass_vault --hidden-import=cryptography --hidden-import=PIL.ImageTk --hidden-import=PIL.ImageOps --hidden-import=PIL.ImageDraw Pass.py
+python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name Pass --collect-submodules pass_vault --hidden-import=cryptography --hidden-import=PIL.ImageTk --hidden-import=PIL.ImageOps --hidden-import=PIL.ImageDraw Pass.py
 ```
 
 ---
@@ -129,7 +131,7 @@ vault_data/
 
 ## Troubleshooting
 
-- **`build_portable.bat` does not create `dist\Pass.exe`**: Ensure Python 3.9+ was installed with **Add python.exe to PATH** and **tcl/tk and IDLE**. Extract the project folder before running, and check Windows Security protection history in case Windows Defender quarantined `dist\Pass.exe`.
+- **`build_portable.bat` fails or Windows Defender flags `Pass.exe`**: Ensure Python 3.9+ was installed with **Add python.exe to PATH** and **tcl/tk and IDLE**. Unsigned PyInstaller executables that call Win32 `LogonUserW`/`DPAPI` APIs can occasionally trigger heuristic (`!ml`) false positives in Windows Defender; building with `--onedir --noupx` minimizes this, or you can run directly from source via `python Pass.py`.
 - **Gmail OTP fails to send**: Enable **2-Step Verification** on your Google Account and use a generated 16-character **App Password** instead of your regular Gmail password.
 
 ---
