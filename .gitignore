@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.spec
+vault_data/
+*.db
+*.bak
+.aistudio/
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
+*.log
