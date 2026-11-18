@@ -1,6 +1,6 @@
 # Pass.py
 
-**Zero-Knowledge Offline Encrypted Password Manager for Windows**
+**Offline Encrypted Password Manager for Windows**
 
 `Version 1.0.0` · `Python 3.9+` · `Windows 10 / 11` · `AES-256-GCM & PBKDF2-HMAC-SHA256`
 
@@ -108,8 +108,8 @@ python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name Pas
 1. **Create Your Vault**: Choose either a **Custom Master Password** or your **Windows Account Password**.
 2. **Set Up Profiles**: Open **Manage People** in the sidebar to add profiles and upload circular avatars.
 3. **Add Credentials**: Click **+ Add New Password**, enter credentials, and pick or upload a site logo.
-4. **Configure Recovery**: Under **Settings -> Login & Security**, add a Recovery Email (and optional Gmail App Password for 6-digit OTP) and save your **16-character Recovery Key** offline.
-5. **Back Up Regularly**: Configure your **Local Backup Folder** under **Settings -> Backup & Sync**.
+4. **Configure Recovery**: Under **Settings → Login & Security**, add a Recovery Email (and optional Gmail App Password for 6-digit OTP) and save your **16-character Recovery Key** offline.
+5. **Back Up Regularly**: Configure your **Local Backup Folder** under **Settings → Backup & Sync**.
 
 ---
 
