@@ -106,7 +106,13 @@ class VaultEntryDialogsMixin:
                 return
             try:
                 mime, b64 = ImageValidator.validate_and_encode(path)
-                matched = next((cl for cl in self.custom_logos if cl.get("data_b64") == b64), None)
+                matched = next(
+                    (
+                        cl for cl in self.custom_logos
+                        if ImageValidator.load_logo_b64(cl.get("file_name", ""), logos_dir=self.db.logos_dir) == b64
+                    ),
+                    None,
+                )
                 if matched:
                     cid = matched["id"]
                 else:
@@ -336,8 +342,7 @@ class VaultEntryDialogsMixin:
                 "title": v_title.get(),
                 "site_url": v_site.get(),
                 "logo_key": chosen_logo,
-                "custom_logo_b64": custom_logo_state["b64"],
-                "custom_logo_mime": custom_logo_state["mime"],
+                "custom_logo_file": custom_logo_state["file"],
                 "username": v_user.get(),
                 "username_is_email": v_is_email.get(),
                 "email": v_email.get(),
@@ -362,7 +367,7 @@ class VaultEntryDialogsMixin:
         self._btn(footer, icon_name="save", text="  Save to Vault", command=save_action, font=(FONT_UI, 10, "bold"), bg=self._c("primary"), fg=self._c("primary_fg"), activebackground=self._c("primary"), activeforeground=self._c("primary_fg"), relief="flat", padx=20, pady=9, cursor="hand2").pack(side="right", fill="x", expand=True, padx=(10, 0))
 
     def open_categories_manager(self) -> None:
-        dlg, frame, footer = self._create_scrollable_dialog("Manage Categories", 460, 480, has_footer=True)
+        dlg, frame, footer = self._create_scrollable_dialog("Manage Categories", 520, 490, has_footer=True)
         tk.Label(frame, text="Categories", font=(FONT_UI, 13, "bold"), bg=self._c("surface"), fg=self._c("text"), anchor="w").pack(fill="x", pady=(0, 8))
 
         list_box = tk.Frame(frame, bg=self._c("surface"))
@@ -374,13 +379,50 @@ class VaultEntryDialogsMixin:
             for w in list_box.winfo_children():
                 w.destroy()
             cats = self.db.list_categories()
-            for c in cats:
+            total = len(cats)
+            for idx, c in enumerate(cats):
                 r = tk.Frame(list_box, bg=self._c("surface_alt"), padx=10, pady=8)
                 r.pack(fill="x", pady=3)
                 tk.Label(r, text=c, font=(FONT_UI, 10), bg=self._c("surface_alt"), fg=self._c("text"), anchor="w").pack(side="left", fill="x", expand=True)
-                if len(cats) > 1:
+                if total > 1:
                     self._btn(r, icon_name="trash", text="  Delete", command=lambda name=c: delete_cat(name), font=(FONT_UI, 9), bg=self._c("danger"), fg="#FFFFFF", activebackground=self._c("danger"), activeforeground="#FFFFFF", relief="flat", padx=8, cursor="hand2").pack(side="right", padx=(6, 0))
-                self._btn(r, icon_name="edit", text="  Edit", command=lambda name=c: start_edit(name), font=(FONT_UI, 9), bg=self._c("surface"), fg=self._c("text"), relief="flat", padx=8, cursor="hand2").pack(side="right")
+                self._btn(r, icon_name="edit", text="  Edit", command=lambda name=c: start_edit(name), font=(FONT_UI, 9), bg=self._c("surface"), fg=self._c("text"), relief="flat", padx=8, cursor="hand2").pack(side="right", padx=(6, 0))
+
+                down_btn = tk.Button(
+                    r,
+                    text="▼",
+                    command=lambda name=c: move_cat(name, 1),
+                    font=(FONT_UI, 8, "bold"),
+                    bg=self._c("surface"),
+                    fg=self._c("text") if idx < total - 1 else self._c("muted"),
+                    relief="flat",
+                    padx=6,
+                    pady=2,
+                    state="normal" if idx < total - 1 else "disabled",
+                    cursor="hand2" if idx < total - 1 else "arrow",
+                )
+                down_btn.pack(side="right", padx=(3, 0))
+
+                up_btn = tk.Button(
+                    r,
+                    text="▲",
+                    command=lambda name=c: move_cat(name, -1),
+                    font=(FONT_UI, 8, "bold"),
+                    bg=self._c("surface"),
+                    fg=self._c("text") if idx > 0 else self._c("muted"),
+                    relief="flat",
+                    padx=6,
+                    pady=2,
+                    state="normal" if idx > 0 else "disabled",
+                    cursor="hand2" if idx > 0 else "arrow",
+                )
+                up_btn.pack(side="right", padx=(6, 0))
+
+        def move_cat(name: str, direction: int) -> None:
+            if self.db.move_category(name, direction):
+                self.reload_data()
+                self._build_list_pane()
+                render_cats()
 
         def start_edit(name: str) -> None:
             editing_old["val"] = name
@@ -450,7 +492,7 @@ class VaultEntryDialogsMixin:
                 badge = self.logos.create_badge_label(
                     r,
                     f"custom:{cl['id']}",
-                    cl["data_b64"],
+                    "",
                     logos,
                     size=36,
                     custom_logo_file=cl.get("file_name", ""),

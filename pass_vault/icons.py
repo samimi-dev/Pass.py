@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .assets import EMBEDDED_ICONS
 from .image_validator import HAS_PILLOW, Image, ImageTk, ImageValidator
-from .paths import AVATARS_DIR
+from .paths import AVATARS_DIR, LOGOS_DIR
 from .theme import FONT_UI
 
 try:
@@ -28,7 +28,9 @@ except ImportError:
 class IconLibrary:
     """Persistent Icon & Brand PhotoImage cache (prevents GC icon disappearing)."""
 
-    def __init__(self) -> None:
+    def __init__(self, logos_dir: str = LOGOS_DIR, avatars_dir: str = AVATARS_DIR) -> None:
+        self.logos_dir = logos_dir
+        self.avatars_dir = avatars_dir
         self._ui_cache: Dict[str, Any] = {}
         self._logo_cache: Dict[str, Any] = {}
 
@@ -74,9 +76,10 @@ class IconLibrary:
 
         resolved_b64 = raw_b64
         if not resolved_b64 and person is not None:
-            resolved_b64 = person.get("avatar_b64", "")
-            if not resolved_b64 and person.get("avatar_file"):
-                resolved_b64 = ImageValidator.load_logo_b64(person["avatar_file"], logos_dir=AVATARS_DIR)
+            if person.get("avatar_file"):
+                resolved_b64 = ImageValidator.load_logo_b64(person["avatar_file"], logos_dir=self.avatars_dir)
+            if not resolved_b64:
+                resolved_b64 = person.get("avatar_b64", "")
 
         if not resolved_b64:
             return self.get_ui_icon(fallback_ui_icon)
@@ -151,12 +154,15 @@ class IconLibrary:
 
         resolved_b64 = custom_logo_b64
         if not resolved_b64 and custom_logo_file:
-            resolved_b64 = ImageValidator.load_logo_b64(custom_logo_file)
+            resolved_b64 = ImageValidator.load_logo_b64(custom_logo_file, logos_dir=self.logos_dir)
         if not resolved_b64 and logo_key.startswith("custom:"):
             cid = logo_key.split(":", 1)[1]
             match = next((cl for cl in custom_logos if cl["id"] == cid), None)
             if match:
-                resolved_b64 = match.get("data_b64", "") or ImageValidator.load_logo_b64(match.get("file_name", ""))
+                resolved_b64 = (
+                    ImageValidator.load_logo_b64(match.get("file_name", ""), logos_dir=self.logos_dir)
+                    or match.get("data_b64", "")
+                )
 
         if not resolved_b64:
             resolved_b64 = EMBEDDED_ICONS.get("site", {}).get(logo_key) or EMBEDDED_ICONS.get("site", {}).get("globe", "")

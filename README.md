@@ -1,14 +1,75 @@
 # Pass.py
 
-**Offline Encrypted Password Manager for Windows**
+**Zero-Knowledge Offline Encrypted Password Manager for Windows**
 
-`Version 1.0.0` · `Python 3.9+` · `Windows 10 / 11` · `AES-256-GCM & PBKDF2-HMAC-SHA256`
+`Version 1.1.0` · `Python 3.9+` · `Windows 10 / 11` · `AES-256-GCM & PBKDF2-HMAC-SHA256`
 
 ---
 
 ## Overview
 
 **Pass.py** is a portable, modular Python desktop application for offline credential storage on Windows. All secrets are encrypted client-side before being saved to a local SQLite database, all UI icons and popular service logos are embedded directly into the source package, and runtime files are stored cleanly in a portable `vault_data/` directory alongside `Pass.py` or `Pass.exe`.
+
+---
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="screenshots/main-page-theme-dark.jpg" alt="Pass.py Dark Theme Workspace" /><br />
+      <sub><strong>Dark Theme Workspace</strong></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="screenshots/main-page-theme-light.jpg" alt="Pass.py Light Theme Workspace" /><br />
+      <sub><strong>Light Theme Workspace</strong></sub>
+    </td>
+  </tr>
+</table>
+
+<details>
+<summary><strong>View More Screenshots (Dialogs &amp; Settings)</strong></summary>
+<br />
+
+<table>
+  <tr>
+    <td align="center" width="25%">
+      <img src="screenshots/manage-categories.jpg" alt="Manage Categories" /><br />
+      <sub><strong>Manage Categories</strong></sub>
+    </td>
+    <td align="center" width="25%">
+      <img src="screenshots/manage-people.jpg" alt="Manage People" /><br />
+      <sub><strong>Manage People</strong></sub>
+    </td>
+    <td align="center" width="25%">
+      <img src="screenshots/password-generator.jpg" alt="Password Generator" /><br />
+      <sub><strong>Password Generator</strong></sub>
+    </td>
+    <td align="center" width="25%">
+      <img src="screenshots/custom-default-logos.jpg" alt="Custom Default Logos" /><br />
+      <sub><strong>Custom Default Logos</strong></sub>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="screenshots/settings-general.jpg" alt="General Settings" /><br />
+      <sub><strong>Settings — General</strong></sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="screenshots/settings-backup-sync.jpg" alt="Backup and Sync Settings" /><br />
+      <sub><strong>Settings — Backup &amp; Sync</strong></sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="screenshots/settings-login-password.jpg" alt="Login and Security Settings" /><br />
+      <sub><strong>Settings — Login &amp; Security</strong></sub>
+    </td>
+  </tr>
+</table>
+
+</details>
 
 ---
 
@@ -42,6 +103,7 @@ Pass.py/
 ├── build_portable.bat          # Windows portable .exe builder
 ├── LICENSE                     # MIT License
 ├── README.md
+├── screenshots/                # UI screenshots for GitHub README
 └── pass_vault/
     ├── __init__.py
     ├── app.py                  # Main window, lock screen, sidebar, list & detail views
@@ -93,7 +155,7 @@ build_portable.bat
 
 The script verifies Python and Tkinter, installs `cryptography`, `pillow`, and `pyinstaller`, embeds the application icon and Windows version metadata (`--onedir --noupx`), and creates:
 - Portable folder: **`dist\Pass\Pass.exe`**
-- Ready-to-distribute archive: **`dist\Pass-v1.0.0-Windows-Portable.zip`**
+- Ready-to-distribute archive: **`dist\Pass-v1.1.0-Windows-Portable.zip`**
 
 Manual command:
 ```bat
@@ -108,8 +170,8 @@ python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name Pas
 1. **Create Your Vault**: Choose either a **Custom Master Password** or your **Windows Account Password**.
 2. **Set Up Profiles**: Open **Manage People** in the sidebar to add profiles and upload circular avatars.
 3. **Add Credentials**: Click **+ Add New Password**, enter credentials, and pick or upload a site logo.
-4. **Configure Recovery**: Under **Settings → Login & Security**, add a Recovery Email (and optional Gmail App Password for 6-digit OTP) and save your **16-character Recovery Key** offline.
-5. **Back Up Regularly**: Configure your **Local Backup Folder** under **Settings → Backup & Sync**.
+4. **Configure Recovery**: Under **Settings -> Login & Security**, add a Recovery Email (and optional Gmail App Password for 6-digit OTP) and save your **16-character Recovery Key** offline.
+5. **Back Up Regularly**: Configure your **Local Backup Folder** under **Settings -> Backup & Sync**.
 
 ---
 

@@ -25,6 +25,8 @@ from .windows_auth import WindowsAuthService
 class VaultRepository:
     """SQLite Encrypted Vault Repository with safe migrations & zero-knowledge Email recovery."""
 
+    _INTERNAL_META_KEY = "_legacy_id_maps"
+
     def __init__(
         self,
         db_path: str = DB_PATH,
@@ -46,6 +48,15 @@ class VaultRepository:
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
 
+    @staticmethod
+    def _db_id(raw_id: Any) -> Any:
+        s = str(raw_id).strip()
+        return int(s) if s.isdigit() else s
+
+    def _table_columns(self, table_name: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return [dict(r) for r in rows]
+
     def _init_schema(self) -> None:
         cur = self.conn.cursor()
         cur.execute(
@@ -62,93 +73,397 @@ class VaultRepository:
             )
             """
         )
-        cols = [r["name"] for r in cur.execute("PRAGMA table_info(vault_meta)").fetchall()]
-        if "recovery_json" not in cols:
+        meta_cols = [c["name"] for c in self._table_columns("vault_meta")]
+        if "recovery_json" not in meta_cols:
             cur.execute("ALTER TABLE vault_meta ADD COLUMN recovery_json TEXT NOT NULL DEFAULT ''")
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS people (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                avatar_file TEXT NOT NULL DEFAULT '',
-                avatar_mime TEXT NOT NULL DEFAULT '',
-                avatar_b64 TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
+        people_id_map: Dict[str, str] = {}
+        logo_id_map: Dict[str, str] = {}
+        needs_entry_slim = False
+        schema_migrated = False
+
+        # --- categories: (id INTEGER PK, name UNIQUE, sort_order) ---
+        cat_info = self._table_columns("categories")
+        if not cat_info:
+            cur.execute(
+                """
+                CREATE TABLE categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    sort_order INTEGER NOT NULL
+                )
+                """
             )
-            """
-        )
-        p_cols = [r["name"] for r in cur.execute("PRAGMA table_info(people)").fetchall()]
-        for col_name in ("avatar_file", "avatar_mime", "avatar_b64"):
-            if col_name not in p_cols:
-                cur.execute(f"ALTER TABLE people ADD COLUMN {col_name} TEXT NOT NULL DEFAULT ''")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS categories (
-                name TEXT PRIMARY KEY,
-                sort_order INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+        else:
+            cat_cols = {c["name"] for c in cat_info}
+            if "id" not in cat_cols or "created_at" in cat_cols:
+                schema_migrated = True
+                old_cats = cur.execute("SELECT name, sort_order FROM categories ORDER BY sort_order ASC, name ASC").fetchall()
+                cur.execute("DROP TABLE IF EXISTS categories_new")
+                cur.execute(
+                    """
+                    CREATE TABLE categories_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL UNIQUE,
+                        sort_order INTEGER NOT NULL
+                    )
+                    """
+                )
+                seen_cats = set()
+                idx = 0
+                for row in old_cats:
+                    cname = str(row["name"]).strip()
+                    if not cname or cname.lower() in seen_cats:
+                        continue
+                    seen_cats.add(cname.lower())
+                    cur.execute("INSERT INTO categories_new (name, sort_order) VALUES (?, ?)", (cname, idx))
+                    idx += 1
+                cur.execute("DROP TABLE categories")
+                cur.execute("ALTER TABLE categories_new RENAME TO categories")
+
+        # --- people: (id INTEGER PK, name UNIQUE, avatar_file, created_at) ---
+        people_info = self._table_columns("people")
+        if not people_info:
+            cur.execute(
+                """
+                CREATE TABLE people (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    avatar_file TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS custom_logos (
-                id TEXT PRIMARY KEY,
-                label TEXT NOT NULL,
-                domain TEXT NOT NULL,
-                mime_type TEXT NOT NULL,
-                data_b64 TEXT NOT NULL,
-                file_name TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
+        else:
+            p_map = {c["name"]: c for c in people_info}
+            p_needs_mig = (
+                "avatar_b64" in p_map
+                or "avatar_mime" in p_map
+                or "relation" in p_map
+                or str(p_map.get("id", {}).get("type", "")).upper() != "INTEGER"
             )
-            """
-        )
-        cl_cols = [r["name"] for r in cur.execute("PRAGMA table_info(custom_logos)").fetchall()]
-        if "file_name" not in cl_cols:
-            cur.execute("ALTER TABLE custom_logos ADD COLUMN file_name TEXT NOT NULL DEFAULT ''")
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS entries (
-                id TEXT PRIMARY KEY,
-                encrypted_blob TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+            if p_needs_mig:
+                schema_migrated = True
+                old_people = cur.execute("SELECT * FROM people ORDER BY rowid ASC").fetchall()
+                cur.execute("DROP TABLE IF EXISTS people_new")
+                cur.execute(
+                    """
+                    CREATE TABLE people_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL UNIQUE,
+                        avatar_file TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                seen_names = set()
+                for row in old_people:
+                    keys = set(row.keys())
+                    old_id = str(row["id"])
+                    name = str(row["name"] or "").strip() or f"User {len(seen_names) + 1}"
+                    if name.lower() in seen_names:
+                        suffix = 2
+                        while f"{name} {suffix}".lower() in seen_names:
+                            suffix += 1
+                        name = f"{name} {suffix}"
+                    seen_names.add(name.lower())
+
+                    avatar_file = str(row["avatar_file"] or "") if "avatar_file" in keys else ""
+                    avatar_b64 = str(row["avatar_b64"] or "") if "avatar_b64" in keys else ""
+                    avatar_mime = (str(row["avatar_mime"] or "") if "avatar_mime" in keys else "") or "image/png"
+                    if avatar_mime not in ALLOWED_IMAGE_MIMES:
+                        avatar_mime = "image/png"
+                    if avatar_b64:
+                        disk_path = os.path.join(self.avatars_dir, os.path.basename(avatar_file)) if avatar_file else ""
+                        if not avatar_file or not os.path.isfile(disk_path):
+                            avatar_file = ImageValidator.save_logo_file(
+                                avatar_b64,
+                                avatar_mime,
+                                f"avatar_{secrets.token_hex(4)}",
+                                logos_dir=self.avatars_dir,
+                            )
+
+                    created_at = str(row["created_at"] or "") if "created_at" in keys else ""
+                    if not created_at:
+                        created_at = datetime.date.today().isoformat()
+
+                    cur.execute(
+                        "INSERT INTO people_new (name, avatar_file, created_at) VALUES (?, ?, ?)",
+                        (name, avatar_file, created_at),
+                    )
+                    people_id_map[old_id] = str(cur.lastrowid)
+                cur.execute("DROP TABLE people")
+                cur.execute("ALTER TABLE people_new RENAME TO people")
+
+        # --- custom_logos: (id INTEGER PK, label, domain, file_name) ---
+        cl_info = self._table_columns("custom_logos")
+        if not cl_info:
+            cur.execute(
+                """
+                CREATE TABLE custom_logos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    file_name TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
+        else:
+            cl_map = {c["name"]: c for c in cl_info}
+            cl_needs_mig = (
+                "data_b64" in cl_map
+                or "mime_type" in cl_map
+                or "created_at" in cl_map
+                or str(cl_map.get("id", {}).get("type", "")).upper() != "INTEGER"
+            )
+            if cl_needs_mig:
+                schema_migrated = True
+                old_logos = cur.execute("SELECT * FROM custom_logos ORDER BY rowid ASC").fetchall()
+                cur.execute("DROP TABLE IF EXISTS custom_logos_new")
+                cur.execute(
+                    """
+                    CREATE TABLE custom_logos_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        label TEXT NOT NULL,
+                        domain TEXT NOT NULL,
+                        file_name TEXT NOT NULL
+                    )
+                    """
+                )
+                for row in old_logos:
+                    keys = set(row.keys())
+                    old_id = str(row["id"])
+                    label = str(row["label"] or "").strip() or "Custom Logo"
+                    domain = str(row["domain"] or "").strip().lower()
+                    file_name = str(row["file_name"] or "") if "file_name" in keys else ""
+                    data_b64 = str(row["data_b64"] or "") if "data_b64" in keys else ""
+                    mime_type = (str(row["mime_type"] or "") if "mime_type" in keys else "") or "image/png"
+                    if mime_type not in ALLOWED_IMAGE_MIMES:
+                        mime_type = "image/png"
+                    if data_b64:
+                        disk_path = os.path.join(self.logos_dir, os.path.basename(file_name)) if file_name else ""
+                        if not file_name or not os.path.isfile(disk_path):
+                            file_name = ImageValidator.save_logo_file(
+                                data_b64,
+                                mime_type,
+                                f"default_{secrets.token_hex(4)}",
+                                logos_dir=self.logos_dir,
+                            )
+                    cur.execute(
+                        "INSERT INTO custom_logos_new (label, domain, file_name) VALUES (?, ?, ?)",
+                        (label, domain, file_name),
+                    )
+                    logo_id_map[old_id] = str(cur.lastrowid)
+                cur.execute("DROP TABLE custom_logos")
+                cur.execute("ALTER TABLE custom_logos_new RENAME TO custom_logos")
+
+        # --- entries: (id INTEGER PK, encrypted_blob, created_at, updated_at) ---
+        entries_info = self._table_columns("entries")
+        if not entries_info:
+            cur.execute(
+                """
+                CREATE TABLE entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    encrypted_blob TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+        else:
+            e_map = {c["name"]: c for c in entries_info}
+            if str(e_map.get("id", {}).get("type", "")).upper() != "INTEGER":
+                schema_migrated = True
+                needs_entry_slim = True
+                old_entries = cur.execute(
+                    "SELECT id, encrypted_blob, created_at, updated_at FROM entries ORDER BY rowid ASC"
+                ).fetchall()
+                cur.execute("DROP TABLE IF EXISTS entries_new")
+                cur.execute(
+                    """
+                    CREATE TABLE entries_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        encrypted_blob TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                for row in old_entries:
+                    cur.execute(
+                        "INSERT INTO entries_new (encrypted_blob, created_at, updated_at) VALUES (?, ?, ?)",
+                        (row["encrypted_blob"], row["created_at"], row["updated_at"]),
+                    )
+                cur.execute("DROP TABLE entries")
+                cur.execute("ALTER TABLE entries_new RENAME TO entries")
+
+        if (people_id_map or logo_id_map or needs_entry_slim) and (
+            cur.execute("SELECT COUNT(*) FROM entries").fetchone()[0] > 0
+        ):
+            meta_row = cur.execute("SELECT settings_json FROM vault_meta WHERE id = 1").fetchone()
+            if meta_row:
+                try:
+                    settings_obj = json.loads(meta_row["settings_json"])
+                except Exception:
+                    settings_obj = {}
+                existing_pending = settings_obj.get(self._INTERNAL_META_KEY) or {}
+                merged_people = dict(existing_pending.get("people") or {})
+                merged_people.update(people_id_map)
+                merged_logos = dict(existing_pending.get("logos") or {})
+                merged_logos.update(logo_id_map)
+                settings_obj[self._INTERNAL_META_KEY] = {
+                    "people": merged_people,
+                    "logos": merged_logos,
+                    "needs_entry_slim": True,
+                }
+                cur.execute(
+                    "UPDATE vault_meta SET settings_json = ? WHERE id = 1",
+                    (json.dumps(settings_obj, ensure_ascii=False),),
+                )
+
         self.conn.commit()
+        if schema_migrated:
+            try:
+                self.conn.execute("VACUUM")
+            except Exception:
+                pass
         self._ensure_default_categories()
 
     def _ensure_default_categories(self) -> None:
         count = self.conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
-        now = datetime.date.today().isoformat()
         if count == 0:
             for idx, name in enumerate(DEFAULT_CATEGORIES):
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO categories (name, sort_order, created_at) VALUES (?, ?, ?)",
-                    (name, idx, now),
+                    "INSERT OR IGNORE INTO categories (name, sort_order) VALUES (?, ?)",
+                    (name, idx),
                 )
             self.conn.commit()
-            return
-        # Ensure newly added default categories exist and default order stays tidy
-        existing = {r["name"] for r in self.conn.execute("SELECT name FROM categories").fetchall()}
-        next_order = (self.conn.execute("SELECT COALESCE(MAX(sort_order), -1) FROM categories").fetchone()[0]) + 1
-        changed = False
-        for idx, name in enumerate(DEFAULT_CATEGORIES):
-            if name not in existing:
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO categories (name, sort_order, created_at) VALUES (?, ?, ?)",
-                    (name, idx if existing.issubset(set(DEFAULT_CATEGORIES) | {"Banking & Finance", "Shopping & Media"}) else next_order, now),
+
+    def _first_person_id(self) -> str:
+        row = self.conn.execute("SELECT id FROM people ORDER BY id ASC LIMIT 1").fetchone()
+        return str(row["id"]) if row else "1"
+
+    def _build_entry_blob_payload(
+        self,
+        entry: Dict[str, Any],
+        chosen_cat: str,
+        default_person_id: str,
+        custom_file: str,
+        custom_logos: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Builds a compact encrypted payload without duplicated SQLite columns or base64 blobs."""
+        title = str(entry.get("title", "")).strip()
+        site_url = str(entry.get("site_url", "")).strip()
+        logo_key = str(entry.get("logo_key") or "").strip() or ImageValidator.match_logo_key(site_url, title, custom_logos)
+        username = str(entry.get("username", "")).strip()
+        username_is_email = bool(entry.get("username_is_email", False))
+        email = "" if username_is_email else str(entry.get("email", "")).strip()
+        notes = str(entry.get("notes", "")).strip()
+        tags = [str(t).strip() for t in (entry.get("tags") or []) if str(t).strip()]
+        is_favorite = bool(entry.get("is_favorite", False))
+        person_id = str(entry.get("person_id") or default_person_id).strip() or default_person_id
+
+        payload: Dict[str, Any] = {
+            "title": title,
+            "password": str(entry.get("password", "")),
+            "category": chosen_cat,
+            "person_id": person_id,
+            "logo_key": logo_key,
+        }
+        if site_url:
+            payload["site_url"] = site_url
+        if custom_file:
+            payload["custom_logo_file"] = custom_file
+        if username:
+            payload["username"] = username
+        if username_is_email:
+            payload["username_is_email"] = True
+        if email:
+            payload["email"] = email
+        if notes:
+            payload["notes"] = notes
+        if tags:
+            payload["tags"] = tags
+        if is_favorite:
+            payload["is_favorite"] = True
+        return payload
+
+    def _migrate_legacy_entries(self, dek: bytes) -> None:
+        """Remaps legacy person/logo IDs inside encrypted entries and trims duplicate blob fields."""
+        with self._lock:
+            meta = self.get_meta()
+            if not meta:
+                return
+            try:
+                raw_settings = json.loads(meta["settings_json"])
+            except Exception:
+                return
+            pending = raw_settings.get(self._INTERNAL_META_KEY)
+            if not isinstance(pending, dict):
+                return
+
+            people_map: Dict[str, str] = {str(k): str(v) for k, v in (pending.get("people") or {}).items()}
+            logos_map: Dict[str, str] = {str(k): str(v) for k, v in (pending.get("logos") or {}).items()}
+            people = self.list_people()
+            valid_pids = {p["id"] for p in people}
+            fallback_pid = people[0]["id"] if people else "1"
+            custom_logos = self.list_custom_logos()
+            cats = self.list_categories()
+            fallback_cat = cats[0] if cats else "General"
+
+            rows = self.conn.execute("SELECT id, encrypted_blob FROM entries ORDER BY id ASC").fetchall()
+            for r in rows:
+                eid = str(r["id"])
+                try:
+                    data = SecurityService.decrypt_json(dek, r["encrypted_blob"])
+                except Exception:
+                    return
+                raw_pid = str(data.get("person_id", "")).strip()
+                mapped_pid = people_map.get(raw_pid, raw_pid)
+                if mapped_pid not in valid_pids:
+                    mapped_pid = fallback_pid
+                data["person_id"] = mapped_pid
+
+                lk = str(data.get("logo_key", "globe"))
+                if lk.startswith("custom:"):
+                    old_cid = lk.split(":", 1)[1]
+                    if old_cid in logos_map:
+                        data["logo_key"] = f"custom:{logos_map[old_cid]}"
+
+                custom_file = str(data.get("custom_logo_file", "") or "")
+                old_b64 = str(data.get("custom_logo_b64", "") or "")
+                old_mime = str(data.get("custom_logo_mime", "image/png") or "image/png")
+                if old_mime not in ALLOWED_IMAGE_MIMES:
+                    old_mime = "image/png"
+                if old_b64 and not custom_file:
+                    custom_file = ImageValidator.save_logo_file(
+                        old_b64,
+                        old_mime,
+                        f"entry_{eid}_{secrets.token_hex(3)}",
+                        logos_dir=self.logos_dir,
+                    )
+
+                chosen_cat = str(data.get("category", "") or "").strip() or fallback_cat
+                payload = self._build_entry_blob_payload(
+                    data,
+                    chosen_cat=chosen_cat,
+                    default_person_id=fallback_pid,
+                    custom_file=custom_file,
+                    custom_logos=custom_logos,
                 )
-                next_order += 1
-                changed = True
-        if existing.issubset(set(DEFAULT_CATEGORIES) | {"Banking & Finance", "Shopping & Media"}):
-            for idx, name in enumerate(DEFAULT_CATEGORIES):
-                self.conn.execute("UPDATE categories SET sort_order = ? WHERE name = ?", (idx, name))
-            changed = True
-        if changed:
+                new_blob = SecurityService.encrypt_json(dek, payload)
+                self.conn.execute("UPDATE entries SET encrypted_blob = ? WHERE id = ?", (new_blob, r["id"]))
+
+            raw_settings.pop(self._INTERNAL_META_KEY, None)
+            self.conn.execute(
+                "UPDATE vault_meta SET settings_json = ? WHERE id = 1",
+                (json.dumps(raw_settings, ensure_ascii=False),),
+            )
             self.conn.commit()
+        try:
+            self.conn.execute("VACUUM")
+        except Exception:
+            pass
 
     def is_initialized(self) -> bool:
         with self._lock:
@@ -196,8 +511,14 @@ class VaultRepository:
                 """,
                 (auth_mode, salt_b64, wrapped_dek, dpapi_dek, json.dumps(default_settings), now),
             )
-            self.conn.execute("INSERT OR IGNORE INTO people (id, name, created_at) VALUES (?, ?, ?)", ("person-self", "Me", now[:10]))
-            self.conn.execute("INSERT OR IGNORE INTO people (id, name, created_at) VALUES (?, ?, ?)", ("person-spouse", "Spouse", now[:10]))
+            self.conn.execute(
+                "INSERT OR IGNORE INTO people (name, avatar_file, created_at) VALUES (?, '', ?)",
+                ("Me", now[:10]),
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO people (name, avatar_file, created_at) VALUES (?, '', ?)",
+                ("Spouse", now[:10]),
+            )
             self._ensure_default_categories()
             self.conn.commit()
         return dek
@@ -239,6 +560,7 @@ class VaultRepository:
 
         self._failed_unlock_attempts = 0
         self._unlock_locked_until = 0.0
+        self._migrate_legacy_entries(dek)
         return dek
 
     def update_auth_mode(self, dek: bytes, current_password: str, new_mode: str, new_password: str) -> None:
@@ -487,24 +809,39 @@ class VaultRepository:
                 (new_salt_b64, new_wrapped, json.dumps(blob, ensure_ascii=False), now_iso),
             )
             self.conn.commit()
+        self._migrate_legacy_entries(dek)
         return dek
 
     def get_settings(self) -> Dict[str, Any]:
         meta = self.get_meta()
-        return json.loads(meta["settings_json"]) if meta else {}
+        if not meta:
+            return {}
+        data = json.loads(meta["settings_json"])
+        if isinstance(data, dict):
+            data.pop(self._INTERNAL_META_KEY, None)
+        return data
 
     def save_settings(self, settings: Dict[str, Any]) -> None:
         now = datetime.datetime.now().isoformat(timespec="seconds")
+        payload = dict(settings)
         with self._lock:
+            meta = self.get_meta()
+            if meta:
+                try:
+                    cur_settings = json.loads(meta["settings_json"])
+                    if isinstance(cur_settings, dict) and self._INTERNAL_META_KEY in cur_settings:
+                        payload[self._INTERNAL_META_KEY] = cur_settings[self._INTERNAL_META_KEY]
+                except Exception:
+                    pass
             self.conn.execute(
                 "UPDATE vault_meta SET settings_json = ?, updated_at = ? WHERE id = 1",
-                (json.dumps(settings, ensure_ascii=False), now),
+                (json.dumps(payload, ensure_ascii=False), now),
             )
             self.conn.commit()
 
     def list_categories(self) -> List[str]:
         with self._lock:
-            rows = self.conn.execute("SELECT name FROM categories ORDER BY sort_order ASC, name ASC").fetchall()
+            rows = self.conn.execute("SELECT name FROM categories ORDER BY sort_order ASC, id ASC").fetchall()
             return [r["name"] for r in rows]
 
     def add_category(self, name: str) -> str:
@@ -518,11 +855,36 @@ class VaultRepository:
                     return c
             max_order = self.conn.execute("SELECT COALESCE(MAX(sort_order), -1) FROM categories").fetchone()[0]
             self.conn.execute(
-                "INSERT INTO categories (name, sort_order, created_at) VALUES (?, ?, ?)",
-                (clean, max_order + 1, datetime.date.today().isoformat()),
+                "INSERT INTO categories (name, sort_order) VALUES (?, ?)",
+                (clean, max_order + 1),
             )
             self.conn.commit()
             return clean
+
+    def move_category(self, name: str, direction: int) -> bool:
+        """Moves category up (direction < 0) or down (direction > 0) and updates sort_order."""
+        if direction == 0:
+            return False
+        step = -1 if direction < 0 else 1
+        with self._lock:
+            rows = [
+                dict(r)
+                for r in self.conn.execute(
+                    "SELECT id, name, sort_order FROM categories ORDER BY sort_order ASC, id ASC"
+                ).fetchall()
+            ]
+            idx = next((i for i, r in enumerate(rows) if r["name"] == name), -1)
+            target_idx = idx + step
+            if idx < 0 or not (0 <= target_idx < len(rows)):
+                return False
+            rows[idx], rows[target_idx] = rows[target_idx], rows[idx]
+            for new_order, row in enumerate(rows):
+                self.conn.execute(
+                    "UPDATE categories SET sort_order = ? WHERE id = ?",
+                    (new_order, row["id"]),
+                )
+            self.conn.commit()
+            return True
 
     def rename_category(self, old_name: str, new_name: str, dek: bytes) -> str:
         clean = new_name.strip()
@@ -534,14 +896,12 @@ class VaultRepository:
             existing = self.list_categories()
             if any(c.lower() == clean.lower() and c != old_name for c in existing):
                 raise ValueError("A category with that name already exists.")
-            row = self.conn.execute("SELECT sort_order, created_at FROM categories WHERE name = ?", (old_name,)).fetchone()
-            sort_order = row["sort_order"] if row else len(existing)
-            created_at = row["created_at"] if row else datetime.date.today().isoformat()
-            self.conn.execute("DELETE FROM categories WHERE name = ?", (old_name,))
-            self.conn.execute(
-                "INSERT OR REPLACE INTO categories (name, sort_order, created_at) VALUES (?, ?, ?)",
-                (clean, sort_order, created_at),
-            )
+            row = self.conn.execute("SELECT id FROM categories WHERE name = ?", (old_name,)).fetchone()
+            if row:
+                self.conn.execute("UPDATE categories SET name = ? WHERE id = ?", (clean, row["id"]))
+            else:
+                max_order = self.conn.execute("SELECT COALESCE(MAX(sort_order), -1) FROM categories").fetchone()[0]
+                self.conn.execute("INSERT INTO categories (name, sort_order) VALUES (?, ?)", (clean, max_order + 1))
             for entry in self.list_entries(dek):
                 if entry.get("category") == old_name:
                     entry["category"] = clean
@@ -566,9 +926,17 @@ class VaultRepository:
     def list_custom_logos(self) -> List[Dict[str, str]]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT id, label, domain, mime_type, data_b64, file_name, created_at FROM custom_logos ORDER BY created_at DESC, label ASC"
+                "SELECT id, label, domain, file_name FROM custom_logos ORDER BY id DESC, label ASC"
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [
+                {
+                    "id": str(r["id"]),
+                    "label": r["label"],
+                    "domain": r["domain"],
+                    "file_name": r["file_name"],
+                }
+                for r in rows
+            ]
 
     def add_custom_logo(self, label: str, domain: str, mime_type: str, data_b64: str) -> str:
         clean_label = label.strip()
@@ -576,27 +944,39 @@ class VaultRepository:
             raise ValueError("Logo name is required.")
         if mime_type not in ALLOWED_IMAGE_MIMES:
             raise ValueError("Only PNG, JPG, JPEG, and GIF formats are allowed.")
-        lid = f"clogo-{secrets.token_hex(4)}"
-        file_name = ImageValidator.save_logo_file(data_b64, mime_type, f"default_{lid}", logos_dir=self.logos_dir)
         with self._lock:
-            self.conn.execute(
-                "INSERT INTO custom_logos (id, label, domain, mime_type, data_b64, file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (lid, clean_label, domain.strip().lower(), mime_type, data_b64, file_name, datetime.date.today().isoformat()),
+            cur = self.conn.execute(
+                "INSERT INTO custom_logos (label, domain, file_name) VALUES (?, ?, '')",
+                (clean_label, domain.strip().lower()),
             )
+            lid = str(cur.lastrowid)
+            try:
+                file_name = ImageValidator.save_logo_file(
+                    data_b64,
+                    mime_type,
+                    f"default_{lid}_{secrets.token_hex(3)}",
+                    logos_dir=self.logos_dir,
+                )
+            except Exception:
+                self.conn.execute("DELETE FROM custom_logos WHERE id = ?", (cur.lastrowid,))
+                self.conn.commit()
+                raise
+            self.conn.execute("UPDATE custom_logos SET file_name = ? WHERE id = ?", (file_name, cur.lastrowid))
             self.conn.commit()
         return lid
 
     def delete_custom_logo(self, logo_id: str, dek: bytes) -> None:
         key_ref = f"custom:{logo_id}"
+        db_lid = self._db_id(logo_id)
         with self._lock:
-            row = self.conn.execute("SELECT file_name FROM custom_logos WHERE id = ?", (logo_id,)).fetchone()
+            row = self.conn.execute("SELECT file_name FROM custom_logos WHERE id = ?", (db_lid,)).fetchone()
             old_file = row["file_name"] if row else ""
-            customs = [c for c in self.list_custom_logos() if c["id"] != logo_id]
+            customs = [c for c in self.list_custom_logos() if c["id"] != str(logo_id)]
             for entry in self.list_entries(dek):
                 if entry.get("logo_key") == key_ref:
                     entry["logo_key"] = ImageValidator.match_logo_key(entry.get("site_url", ""), entry.get("title", ""), customs)
                     self.save_entry(entry, dek)
-            self.conn.execute("DELETE FROM custom_logos WHERE id = ?", (logo_id,))
+            self.conn.execute("DELETE FROM custom_logos WHERE id = ?", (db_lid,))
             self.conn.commit()
         if old_file:
             ImageValidator.delete_logo_file(old_file, logos_dir=self.logos_dir)
@@ -604,13 +984,17 @@ class VaultRepository:
     def list_people(self) -> List[Dict[str, str]]:
         with self._lock:
             rows = self.conn.execute(
-                "SELECT id, name, avatar_file, avatar_mime, avatar_b64, created_at FROM people ORDER BY created_at ASC, name ASC"
+                "SELECT id, name, avatar_file, created_at FROM people ORDER BY id ASC"
             ).fetchall()
-            people = [dict(r) for r in rows]
-        for p in people:
-            if not p.get("avatar_b64") and p.get("avatar_file"):
-                p["avatar_b64"] = ImageValidator.load_logo_b64(p["avatar_file"], logos_dir=self.avatars_dir)
-        return people
+            return [
+                {
+                    "id": str(r["id"]),
+                    "name": r["name"],
+                    "avatar_file": r["avatar_file"],
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ]
 
     def upsert_person(
         self,
@@ -629,56 +1013,62 @@ class VaultRepository:
         with self._lock:
             existing = self.list_people()
             for p in existing:
-                if p["name"].strip().lower() == clean.lower() and p["id"] != person_id:
+                if p["name"].strip().lower() == clean.lower() and p["id"] != str(person_id or ""):
                     raise ValueError(f"Person '{clean}' already exists.")
-            pid = person_id or f"person-{secrets.token_hex(4)}"
             now = datetime.date.today().isoformat()
             old_row = (
                 self.conn.execute(
-                    "SELECT id, avatar_file, avatar_mime, avatar_b64, created_at FROM people WHERE id = ?",
-                    (pid,),
+                    "SELECT id, avatar_file, created_at FROM people WHERE id = ?",
+                    (self._db_id(person_id),),
                 ).fetchone()
-                if person_id
+                if person_id is not None and str(person_id).strip() != ""
                 else None
             )
-            old_file = old_row["avatar_file"] if old_row else ""
-            if clear_avatar:
-                new_file, new_mime, new_b64 = "", "", ""
-                if old_file:
-                    old_file_to_delete = old_file
-            elif avatar_b64:
-                new_file = ImageValidator.save_logo_file(
-                    avatar_b64,
-                    avatar_mime,
-                    f"avatar_{pid}_{secrets.token_hex(3)}",
-                    logos_dir=self.avatars_dir,
-                )
-                new_mime = avatar_mime
-                new_b64 = avatar_b64
-                if old_file and old_file != new_file:
-                    old_file_to_delete = old_file
-            else:
-                new_file = old_file
-                new_mime = old_row["avatar_mime"] if old_row else ""
-                new_b64 = old_row["avatar_b64"] if old_row else ""
 
             if old_row:
+                pid = str(old_row["id"])
+                old_file = old_row["avatar_file"] or ""
+                if clear_avatar:
+                    new_file = ""
+                    if old_file:
+                        old_file_to_delete = old_file
+                elif avatar_b64:
+                    new_file = ImageValidator.save_logo_file(
+                        avatar_b64,
+                        avatar_mime,
+                        f"avatar_{pid}_{secrets.token_hex(3)}",
+                        logos_dir=self.avatars_dir,
+                    )
+                    if old_file and old_file != new_file:
+                        old_file_to_delete = old_file
+                else:
+                    new_file = old_file
                 self.conn.execute(
-                    "UPDATE people SET name = ?, avatar_file = ?, avatar_mime = ?, avatar_b64 = ? WHERE id = ?",
-                    (clean, new_file, new_mime, new_b64, pid),
+                    "UPDATE people SET name = ?, avatar_file = ? WHERE id = ?",
+                    (clean, new_file, old_row["id"]),
                 )
             else:
-                cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(people)").fetchall()]
-                if "relation" in cols:
-                    self.conn.execute(
-                        "INSERT INTO people (id, name, relation, avatar_file, avatar_mime, avatar_b64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (pid, clean, "", new_file, new_mime, new_b64, now),
-                    )
-                else:
-                    self.conn.execute(
-                        "INSERT INTO people (id, name, avatar_file, avatar_mime, avatar_b64, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (pid, clean, new_file, new_mime, new_b64, now),
-                    )
+                cur = self.conn.execute(
+                    "INSERT INTO people (name, avatar_file, created_at) VALUES (?, '', ?)",
+                    (clean, now),
+                )
+                pid = str(cur.lastrowid)
+                if avatar_b64 and not clear_avatar:
+                    try:
+                        new_file = ImageValidator.save_logo_file(
+                            avatar_b64,
+                            avatar_mime,
+                            f"avatar_{pid}_{secrets.token_hex(3)}",
+                            logos_dir=self.avatars_dir,
+                        )
+                        self.conn.execute(
+                            "UPDATE people SET avatar_file = ? WHERE id = ?",
+                            (new_file, cur.lastrowid),
+                        )
+                    except Exception:
+                        self.conn.execute("DELETE FROM people WHERE id = ?", (cur.lastrowid,))
+                        self.conn.commit()
+                        raise
             self.conn.commit()
         if old_file_to_delete:
             ImageValidator.delete_logo_file(old_file_to_delete, logos_dir=self.avatars_dir)
@@ -686,34 +1076,56 @@ class VaultRepository:
 
     def delete_person(self, person_id: str, dek: bytes) -> None:
         old_file = ""
+        target_pid = str(person_id)
+        db_pid = self._db_id(person_id)
         with self._lock:
             people = self.list_people()
             if len(people) <= 1:
                 raise ValueError("At least one person must remain in the vault.")
-            row = self.conn.execute("SELECT avatar_file FROM people WHERE id = ?", (person_id,)).fetchone()
+            row = self.conn.execute("SELECT avatar_file FROM people WHERE id = ?", (db_pid,)).fetchone()
             old_file = row["avatar_file"] if row else ""
             for entry in self.list_entries(dek):
-                if entry.get("person_id") == person_id:
+                if entry.get("person_id") == target_pid:
                     self.delete_entry(entry["id"], dek=dek)
-            self.conn.execute("DELETE FROM people WHERE id = ?", (person_id,))
+            self.conn.execute("DELETE FROM people WHERE id = ?", (db_pid,))
             self.conn.commit()
         if old_file:
             ImageValidator.delete_logo_file(old_file, logos_dir=self.avatars_dir)
 
     def list_entries(self, dek: bytes) -> List[Dict[str, Any]]:
+        self._migrate_legacy_entries(dek)
         with self._lock:
-            rows = self.conn.execute("SELECT id, encrypted_blob FROM entries ORDER BY updated_at DESC").fetchall()
+            rows = self.conn.execute(
+                "SELECT id, encrypted_blob, created_at, updated_at FROM entries ORDER BY updated_at DESC, id DESC"
+            ).fetchall()
         result: List[Dict[str, Any]] = []
         for r in rows:
             data = SecurityService.decrypt_json(dek, r["encrypted_blob"])
-            data["id"] = r["id"]
+            data["id"] = str(r["id"])
+            data["created_at"] = r["created_at"]
+            data["updated_at"] = r["updated_at"]
+            data.setdefault("site_url", "")
+            data.setdefault("logo_key", "globe")
+            data.setdefault("custom_logo_file", "")
+            data.setdefault("username", "")
+            data.setdefault("username_is_email", False)
+            if data["username_is_email"]:
+                data["email"] = data["username"]
+            else:
+                data.setdefault("email", "")
+            data.setdefault("notes", "")
+            data.setdefault("tags", [])
+            data.setdefault("is_favorite", False)
+            if data.get("person_id") is not None:
+                data["person_id"] = str(data["person_id"])
             result.append(data)
         return result
 
     def save_entry(self, entry: Dict[str, Any], dek: bytes) -> str:
-        eid = entry.get("id") or f"entry-{secrets.token_hex(6)}"
+        raw_id = entry.get("id")
+        eid_int = int(str(raw_id).strip()) if (raw_id is not None and str(raw_id).strip().isdigit()) else None
         now_iso = datetime.datetime.now().isoformat(timespec="seconds")
-        created_at = entry.get("created_at") or datetime.date.today().isoformat()
+        created_at = str(entry.get("created_at") or "").strip() or datetime.date.today().isoformat()
         with self._lock:
             cats = self.list_categories()
             chosen_cat = (entry.get("category") or "").strip() or (cats[0] if cats else "General")
@@ -721,56 +1133,65 @@ class VaultRepository:
                 self.add_category(chosen_cat)
 
             custom_logos = self.list_custom_logos()
-            custom_b64 = entry.get("custom_logo_b64", "")
-            custom_mime = entry.get("custom_logo_mime", "image/png")
-            prev_row = self.conn.execute("SELECT encrypted_blob FROM entries WHERE id = ?", (eid,)).fetchone()
+            default_pid = self._first_person_id()
+            prev_row = (
+                self.conn.execute("SELECT encrypted_blob FROM entries WHERE id = ?", (eid_int,)).fetchone()
+                if eid_int is not None
+                else None
+            )
             prev_file = ""
             if prev_row:
                 try:
                     prev_file = SecurityService.decrypt_json(dek, prev_row["encrypted_blob"]).get("custom_logo_file", "")
                 except Exception:
                     prev_file = ""
+
+            custom_b64 = str(entry.get("custom_logo_b64") or "")
+            custom_mime = str(entry.get("custom_logo_mime") or "image/png")
+            passed_file = str(entry.get("custom_logo_file") or "")
+
             if custom_b64:
-                custom_file = ImageValidator.save_logo_file(custom_b64, custom_mime, f"entry_{eid}", logos_dir=self.logos_dir)
+                stem = f"entry_{eid_int}" if eid_int is not None else f"entry_{secrets.token_hex(4)}"
+                custom_file = ImageValidator.save_logo_file(custom_b64, custom_mime, stem, logos_dir=self.logos_dir)
                 if prev_file and prev_file != custom_file:
                     ImageValidator.delete_logo_file(prev_file, logos_dir=self.logos_dir)
             else:
-                custom_file = ""
-                if prev_file:
+                custom_file = passed_file
+                if prev_file and prev_file != custom_file:
                     ImageValidator.delete_logo_file(prev_file, logos_dir=self.logos_dir)
 
-            payload = {
-                "id": eid,
-                "title": entry.get("title", "").strip(),
-                "site_url": entry.get("site_url", "").strip(),
-                "logo_key": entry.get("logo_key") or ImageValidator.match_logo_key(entry.get("site_url", ""), entry.get("title", ""), custom_logos),
-                "custom_logo_b64": custom_b64,
-                "custom_logo_mime": custom_mime,
-                "custom_logo_file": custom_file,
-                "username": entry.get("username", "").strip(),
-                "username_is_email": bool(entry.get("username_is_email", False)),
-                "password": entry.get("password", ""),
-                "email": entry.get("username", "").strip() if entry.get("username_is_email") else entry.get("email", "").strip(),
-                "notes": entry.get("notes", "").strip(),
-                "category": chosen_cat,
-                "tags": [t.strip() for t in entry.get("tags", []) if t.strip()],
-                "is_favorite": bool(entry.get("is_favorite", False)),
-                "person_id": entry.get("person_id") or "person-self",
-                "created_at": created_at,
-                "updated_at": now_iso,
-            }
-            blob = SecurityService.encrypt_json(dek, payload)
-            self.conn.execute(
-                "INSERT OR REPLACE INTO entries (id, encrypted_blob, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (eid, blob, created_at, now_iso),
+            payload = self._build_entry_blob_payload(
+                entry,
+                chosen_cat=chosen_cat,
+                default_person_id=default_pid,
+                custom_file=custom_file,
+                custom_logos=custom_logos,
             )
+            blob = SecurityService.encrypt_json(dek, payload)
+            if prev_row and eid_int is not None:
+                self.conn.execute(
+                    "UPDATE entries SET encrypted_blob = ?, created_at = ?, updated_at = ? WHERE id = ?",
+                    (blob, created_at, now_iso, eid_int),
+                )
+            elif eid_int is not None:
+                self.conn.execute(
+                    "INSERT INTO entries (id, encrypted_blob, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (eid_int, blob, created_at, now_iso),
+                )
+            else:
+                cur = self.conn.execute(
+                    "INSERT INTO entries (encrypted_blob, created_at, updated_at) VALUES (?, ?, ?)",
+                    (blob, created_at, now_iso),
+                )
+                eid_int = int(cur.lastrowid)
             self.conn.commit()
-        return eid
+        return str(eid_int)
 
     def delete_entry(self, entry_id: str, dek: Optional[bytes] = None) -> None:
+        db_eid = self._db_id(entry_id)
         with self._lock:
             if dek is not None:
-                row = self.conn.execute("SELECT encrypted_blob FROM entries WHERE id = ?", (entry_id,)).fetchone()
+                row = self.conn.execute("SELECT encrypted_blob FROM entries WHERE id = ?", (db_eid,)).fetchone()
                 if row:
                     try:
                         old_file = SecurityService.decrypt_json(dek, row["encrypted_blob"]).get("custom_logo_file", "")
@@ -778,7 +1199,7 @@ class VaultRepository:
                             ImageValidator.delete_logo_file(old_file, logos_dir=self.logos_dir)
                     except Exception:
                         pass
-            self.conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+            self.conn.execute("DELETE FROM entries WHERE id = ?", (db_eid,))
             self.conn.commit()
 
     def create_local_backup(self, backup_dir: Optional[str] = None) -> str:
@@ -805,14 +1226,53 @@ class VaultRepository:
                 pass
         return target
 
+    @staticmethod
+    def _mime_for_filename(filename: str) -> str:
+        ext = os.path.splitext(filename.lower())[1]
+        if ext in (".jpg", ".jpeg"):
+            return "image/jpeg"
+        if ext == ".gif":
+            return "image/gif"
+        return "image/png"
+
     def export_e2ee_envelope(self, dek: bytes) -> Tuple[Dict[str, Any], int]:
         with self._lock:
-            entries = self.list_entries(dek)
+            raw_entries = self.list_entries(dek)
+            entries_out: List[Dict[str, Any]] = []
+            for e in raw_entries:
+                item = dict(e)
+                if item.get("custom_logo_file"):
+                    b64 = ImageValidator.load_logo_b64(item["custom_logo_file"], logos_dir=self.logos_dir)
+                    if b64:
+                        item["custom_logo_b64"] = b64
+                        item["custom_logo_mime"] = self._mime_for_filename(item["custom_logo_file"])
+                entries_out.append(item)
+
+            people_out: List[Dict[str, Any]] = []
+            for p in self.list_people():
+                item = dict(p)
+                if item.get("avatar_file"):
+                    b64 = ImageValidator.load_logo_b64(item["avatar_file"], logos_dir=self.avatars_dir)
+                    if b64:
+                        item["avatar_b64"] = b64
+                        item["avatar_mime"] = self._mime_for_filename(item["avatar_file"])
+                people_out.append(item)
+
+            logos_out: List[Dict[str, Any]] = []
+            for cl in self.list_custom_logos():
+                item = dict(cl)
+                if item.get("file_name"):
+                    b64 = ImageValidator.load_logo_b64(item["file_name"], logos_dir=self.logos_dir)
+                    if b64:
+                        item["data_b64"] = b64
+                        item["mime_type"] = self._mime_for_filename(item["file_name"])
+                logos_out.append(item)
+
             snapshot = {
-                "entries": entries,
-                "people": self.list_people(),
+                "entries": entries_out,
+                "people": people_out,
                 "categories": self.list_categories(),
-                "customLogos": self.list_custom_logos(),
+                "customLogos": logos_out,
                 "settings": self.get_settings(),
                 "exported_at": datetime.datetime.now().isoformat(),
             }
@@ -825,7 +1285,7 @@ class VaultRepository:
             "salt": base64.b64encode(salt).decode("ascii"),
             "ciphertext": packed,
             "updatedAt": datetime.datetime.now().isoformat(),
-        }, len(entries))
+        }, len(raw_entries))
 
     def push_cloud_sync(self, dek: bytes, is_auto_backup: bool = False) -> None:
         settings = self.get_settings()
@@ -869,26 +1329,63 @@ class VaultRepository:
             for cat in snapshot.get("categories", []):
                 if isinstance(cat, str) and cat.strip():
                     self.add_category(cat)
+
+            logo_id_remap: Dict[str, str] = {}
+            existing_logos = self.list_custom_logos()
             for cl in snapshot.get("customLogos", []):
                 if not isinstance(cl, dict) or not cl.get("id") or not cl.get("label"):
                     continue
                 mime = cl.get("mime_type") or "image/png"
                 b64 = cl.get("data_b64") or ""
-                if b64 and mime in ALLOWED_IMAGE_MIMES:
-                    cid = re.sub(r"[^a-zA-Z0-9_-]", "", str(cl["id"]))[:40]
-                    if not cid:
-                        continue
-                    fname = ImageValidator.save_logo_file(b64, mime, f"default_{cid}", logos_dir=self.logos_dir)
-                    self.conn.execute(
-                        "INSERT OR REPLACE INTO custom_logos (id, label, domain, mime_type, data_b64, file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (cid, str(cl["label"])[:60], str(cl.get("domain", "")), mime, b64, fname, str(cl.get("created_at") or datetime.date.today().isoformat())),
-                    )
+                if not b64 or mime not in ALLOWED_IMAGE_MIMES:
+                    continue
+                old_cid = str(cl["id"])
+                matched = next(
+                    (
+                        cur_l for cur_l in existing_logos
+                        if ImageValidator.load_logo_b64(cur_l.get("file_name", ""), logos_dir=self.logos_dir) == b64
+                    ),
+                    None,
+                )
+                if matched:
+                    logo_id_remap[old_cid] = matched["id"]
+                else:
+                    new_cid = self.add_custom_logo(str(cl["label"])[:60], str(cl.get("domain", "")), mime, b64)
+                    logo_id_remap[old_cid] = new_cid
+                    existing_logos = self.list_custom_logos()
+
+            person_id_remap: Dict[str, str] = {}
+            existing_people = self.list_people()
             for p in snapshot.get("people", []):
-                if isinstance(p, dict) and p.get("id") and p.get("name"):
-                    self.upsert_person(str(p["id"]), str(p["name"]))
+                if not isinstance(p, dict) or not p.get("name"):
+                    continue
+                old_pid = str(p.get("id", ""))
+                pname = str(p["name"]).strip()
+                existing_match = next((ep for ep in existing_people if ep["name"].strip().lower() == pname.lower()), None)
+                avatar_b64 = str(p.get("avatar_b64") or "")
+                avatar_mime = str(p.get("avatar_mime") or "image/png")
+                new_pid = self.upsert_person(
+                    existing_match["id"] if existing_match else None,
+                    pname,
+                    avatar_mime=avatar_mime if avatar_b64 else "",
+                    avatar_b64=avatar_b64,
+                )
+                if old_pid:
+                    person_id_remap[old_pid] = new_pid
+                existing_people = self.list_people()
+
             entries = [e for e in snapshot.get("entries", []) if isinstance(e, dict)]
             for e in entries:
-                self.save_entry(e, dek)
+                entry_copy = dict(e)
+                old_pid = str(entry_copy.get("person_id", ""))
+                if old_pid in person_id_remap:
+                    entry_copy["person_id"] = person_id_remap[old_pid]
+                lk = str(entry_copy.get("logo_key", ""))
+                if lk.startswith("custom:"):
+                    old_cid = lk.split(":", 1)[1]
+                    if old_cid in logo_id_remap:
+                        entry_copy["logo_key"] = f"custom:{logo_id_remap[old_cid]}"
+                self.save_entry(entry_copy, dek)
             self.conn.commit()
         return len(entries)
 

@@ -39,7 +39,7 @@ class ThemeManager:
     }
     FONT_UI = "Segoe UI"
     FONT_MONO = "Consolas"
-    APP_VERSION = "v1.0.0"
+    APP_VERSION = "v1.1.0"
 
     @classmethod
     def color(cls, theme_name: str, key: str) -> str:

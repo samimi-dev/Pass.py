@@ -42,7 +42,7 @@ class PassVaultApp(VaultEntryDialogsMixin, VaultSecurityDialogsMixin, _TK_BASE):
         self.minsize(900, 540)
 
         self.db = VaultRepository()
-        self.logos = IconLibrary()
+        self.logos = IconLibrary(logos_dir=self.db.logos_dir, avatars_dir=self.db.avatars_dir)
         self.dek: Optional[bytes] = None
         self.entries: List[Dict[str, Any]] = []
         self.people: List[Dict[str, str]] = []

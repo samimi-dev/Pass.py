@@ -7,11 +7,10 @@ dist/
 vault_data/
 *.db
 *.bak
-.aistudio/
+.idea/
 .venv/
 venv/
 .env
 .DS_Store
 Thumbs.db
 *.log
-.idea/
